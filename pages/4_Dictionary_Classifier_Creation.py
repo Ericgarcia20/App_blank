@@ -284,8 +284,9 @@ def create_confusion_matrix_plot(metrics):
                     color_continuous_scale="Blues",
                     labels=dict(x="Predicted", y="Actual", color="Count"))
     
-    fig.update_xaxis(tickvals=[0, 1], ticktext=['Negative', 'Positive'])
-    fig.update_yaxis(tickvals=[0, 1], ticktext=['Positive', 'Negative'])
+    # FIXED: Changed from update_xaxis to update_xaxes and update_yaxis to update_yaxes
+    fig.update_xaxes(tickvals=[0, 1], ticktext=['Negative', 'Positive'])
+    fig.update_yaxes(tickvals=[0, 1], ticktext=['Positive', 'Negative'])
     fig.update_layout(title="Confusion Matrix", height=400)
     
     return fig
