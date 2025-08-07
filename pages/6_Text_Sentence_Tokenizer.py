@@ -159,13 +159,12 @@ class TextSentenceTokenizer:
             self.sentence_patterns = [r'[.!?]+\s+', r'[.!?]+$']
 
     def tokenize_text_to_sentences(self):
-        """Tokenize text data into sentences"""
+        """Tokenize text data into sentences - FIXED to only output specific columns"""
         if self.raw_df is None or 'selected_text' not in self.raw_df.columns:
             st.error("❌ No text data available for tokenization")
             return False
 
         all_sentences = []
-        sentence_metadata = []
         total_texts = len(self.raw_df)
         
         # Create progress bar
@@ -192,30 +191,34 @@ class TextSentenceTokenizer:
                 if self.min_sentence_length <= len(sentence) <= self.max_sentence_length:
                     valid_sentences.append(sentence)
 
-            # Store sentences with metadata
+            # Store sentences with ONLY the required columns
             for sent_idx, sentence in enumerate(valid_sentences):
-                all_sentences.append(sentence)
+                sentence_data = {}
                 
-                metadata = {
-                    'original_text_id': idx,
-                    'sentence_id': f"{idx}_{sent_idx}",
-                    'sentence_position': sent_idx,
-                    'sentence_length': len(sentence),
-                    'word_count': len(sentence.split()),
-                    'has_punctuation': bool(re.search(r'[.!?]', sentence)),
-                    'has_capitalization': bool(re.search(r'[A-Z]', sentence)),
-                    'sentence_text': sentence
-                }
+                # Only include the 5 specific columns shown in the image
+                required_columns = ['shortcode', 'turn', 'caption', 'transcript', 'post_url']
+                
+                for col in required_columns:
+                    if col in self.raw_df.columns:
+                        sentence_data[col] = row[col]
+                    else:
+                        # Handle missing columns gracefully
+                        if col == 'turn':
+                            sentence_data[col] = sent_idx  # Use sentence position as turn
+                        elif col == 'caption' or col == 'transcript':
+                            sentence_data[col] = sentence  # Use the tokenized sentence
+                        else:
+                            sentence_data[col] = ''  # Empty string for missing columns
+                
+                # If caption or transcript was the selected text column, update it with the sentence
+                if 'caption' in sentence_data and 'selected_text' in self.raw_df.columns:
+                    if self.raw_df.columns[self.raw_df.columns.get_loc('selected_text')] in ['caption', 'transcript']:
+                        sentence_data['caption' if 'caption' in required_columns else 'transcript'] = sentence
+                
+                all_sentences.append(sentence_data)
 
-                # Add original columns if they exist
-                original_cols_to_add = [col for col in self.raw_df.columns if col not in ['selected_text', 'index']]
-                for col in original_cols_to_add:
-                    metadata[f'original_{col}'] = row[col]
-
-                sentence_metadata.append(metadata)
-
-        # Create tokenized dataframe
-        self.tokenized_df = pd.DataFrame(sentence_metadata)
+        # Create tokenized dataframe with only the required columns
+        self.tokenized_df = pd.DataFrame(all_sentences)
         
         progress_bar.progress(1.0)
         status_text.text("✅ Tokenization completed!")
@@ -315,26 +318,40 @@ class TextSentenceTokenizer:
 
         total_sentences = len(self.tokenized_df)
         
-        if 'original_text_id' in self.tokenized_df.columns:
-            unique_original_texts = self.tokenized_df['original_text_id'].nunique()
-            avg_sentences_per_text = total_sentences / unique_original_texts if unique_original_texts > 0 else 0
-        else:
-            unique_original_texts = 0
-            avg_sentences_per_text = 0
+        # Since we're only keeping specific columns, we need to adapt the analysis
+        sentence_lengths = []
+        word_counts = []
+        
+        # Determine which column contains the actual sentence text
+        text_columns = ['caption', 'transcript']
+        sentence_text_col = None
+        
+        for col in text_columns:
+            if col in self.tokenized_df.columns:
+                sentence_text_col = col
+                break
+        
+        if sentence_text_col:
+            for text in self.tokenized_df[sentence_text_col]:
+                if pd.notna(text) and str(text).strip():
+                    sentence_lengths.append(len(str(text)))
+                    word_counts.append(len(str(text).split()))
 
-        # Length and word count statistics
-        length_stats_desc = {}
-        word_count_stats_desc = {}
-        
-        if 'sentence_length' in self.tokenized_df.columns:
-            length_stats_desc = self.tokenized_df['sentence_length'].describe()
-        
-        if 'word_count' in self.tokenized_df.columns:
-            word_count_stats_desc = self.tokenized_df['word_count'].describe()
+        # Calculate statistics
+        length_stats_desc = pd.Series(sentence_lengths).describe() if sentence_lengths else pd.Series([])
+        word_count_stats_desc = pd.Series(word_counts).describe() if word_counts else pd.Series([])
 
         # Content analysis
-        punct_count = self.tokenized_df['has_punctuation'].sum() if 'has_punctuation' in self.tokenized_df.columns else 0
-        cap_count = self.tokenized_df['has_capitalization'].sum() if 'has_capitalization' in self.tokenized_df.columns else 0
+        punct_count = 0
+        cap_count = 0
+        
+        if sentence_text_col:
+            for text in self.tokenized_df[sentence_text_col]:
+                if pd.notna(text) and str(text).strip():
+                    if re.search(r'[.!?]', str(text)):
+                        punct_count += 1
+                    if re.search(r'[A-Z]', str(text)):
+                        cap_count += 1
 
         punct_pct = punct_count / total_sentences * 100 if total_sentences > 0 else 0
         cap_pct = cap_count / total_sentences * 100 if total_sentences > 0 else 0
@@ -342,8 +359,6 @@ class TextSentenceTokenizer:
         # Store statistics
         self.sentence_stats = {
             'total_sentences': total_sentences,
-            'unique_texts': unique_original_texts,
-            'avg_sentences_per_text': avg_sentences_per_text,
             'length_stats': length_stats_desc,
             'word_count_stats': word_count_stats_desc,
             'punctuation_pct': punct_pct,
@@ -352,15 +367,23 @@ class TextSentenceTokenizer:
 
     def search_sentences(self, query, max_results=20):
         """Search sentences containing specific text"""
-        if self.tokenized_df is None or self.tokenized_df.empty or 'sentence_text' not in self.tokenized_df.columns:
+        if self.tokenized_df is None or self.tokenized_df.empty:
             return pd.DataFrame()
 
-        # Case-insensitive search
-        matches = self.tokenized_df[
-            self.tokenized_df['sentence_text'].str.contains(query, case=False, na=False)
-        ]
-
-        return matches.head(max_results)
+        # Search in caption and transcript columns
+        text_columns = ['caption', 'transcript']
+        matches = pd.DataFrame()
+        
+        for col in text_columns:
+            if col in self.tokenized_df.columns:
+                col_matches = self.tokenized_df[
+                    self.tokenized_df[col].astype(str).str.contains(query, case=False, na=False)
+                ]
+                matches = pd.concat([matches, col_matches], ignore_index=True)
+        
+        # Remove duplicates and return top results
+        matches = matches.drop_duplicates().head(max_results)
+        return matches
 
 # Initialize session state
 if 'tokenizer' not in st.session_state:
@@ -464,6 +487,10 @@ def tokenization_page():
                 avg_length = st.session_state.tokenizer.raw_df['selected_text'].str.len().mean()
                 st.metric("Average Text Length", f"{avg_length:.0f} chars")
         
+        # Expected output columns info
+        st.subheader("📋 Output Columns")
+        st.info("The output CSV will contain only these columns:\n• shortcode\n• turn\n• caption\n• transcript\n• post_url")
+        
         # Pattern examples
         st.subheader("💡 Pattern Examples")
         with st.expander("See examples"):
@@ -494,6 +521,10 @@ r'(?<=[.!?])\\s*@'  # Before mentions
                     # Show quick stats
                     total_sentences = len(st.session_state.tokenizer.tokenized_df)
                     st.metric("Sentences Created", total_sentences)
+                    
+                    # Show column preview
+                    st.subheader("📋 Output Preview")
+                    st.dataframe(st.session_state.tokenizer.tokenized_df.head(), use_container_width=True)
 
 def analysis_page():
     st.markdown("<h2 class='section-header'>📊 Analysis & Results</h2>", unsafe_allow_html=True)
@@ -519,14 +550,15 @@ def analysis_page():
         total_sentences = stats.get('total_sentences', 0)
         st.metric("Total Sentences", f"{total_sentences:,}")
     with col2:
-        unique_texts = stats.get('unique_texts', 0)
-        st.metric("Original Texts", f"{unique_texts:,}")
-    with col3:
-        avg_sentences = stats.get('avg_sentences_per_text', 0)
-        st.metric("Avg Sentences/Text", f"{avg_sentences:.1f}")
-    with col4:
         punctuation_pct = stats.get('punctuation_pct', 0)
         st.metric("With Punctuation", f"{punctuation_pct:.1f}%")
+    with col3:
+        capitalization_pct = stats.get('capitalization_pct', 0)
+        st.metric("With Capitalization", f"{capitalization_pct:.1f}%")
+    with col4:
+        # Show number of output columns
+        if st.session_state.tokenizer.tokenized_df is not None:
+            st.metric("Output Columns", len(st.session_state.tokenizer.tokenized_df.columns))
 
     # Detailed statistics
     col1, col2 = st.columns(2)
@@ -561,60 +593,11 @@ def analysis_page():
         except Exception as e:
             st.info("Word count statistics not available")
 
-    # Visualizations using Streamlit charts
-    st.subheader("📊 Data Visualizations")
-    
-    # Check if tokenized dataframe exists before visualization
-    if st.session_state.tokenizer.tokenized_df is None or st.session_state.tokenizer.tokenized_df.empty:
-        st.warning("⚠️ No tokenized data available for visualization")
-        return
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Sentence length distribution
-        try:
-            if 'sentence_length' in st.session_state.tokenizer.tokenized_df.columns:
-                st.subheader("Sentence Length Distribution")
-                length_counts = st.session_state.tokenizer.tokenized_df['sentence_length'].value_counts().sort_index()
-                st.bar_chart(length_counts)
-        except Exception as e:
-            st.info("Length distribution chart not available")
-        
-        # Word count distribution
-        try:
-            if 'word_count' in st.session_state.tokenizer.tokenized_df.columns:
-                st.subheader("Word Count Distribution")
-                word_counts = st.session_state.tokenizer.tokenized_df['word_count'].value_counts().sort_index()
-                st.bar_chart(word_counts)
-        except Exception as e:
-            st.info("Word count distribution chart not available")
-    
-    with col2:
-        # Sentences per text
-        try:
-            if 'original_text_id' in st.session_state.tokenizer.tokenized_df.columns:
-                st.subheader("Sentences per Original Text")
-                sentences_per_text = st.session_state.tokenizer.tokenized_df.groupby('original_text_id').size()
-                st.bar_chart(sentences_per_text.value_counts().sort_index())
-        except Exception as e:
-            st.info("Sentences per text chart not available")
-        
-        # Content features
-        try:
-            st.subheader("Content Features")
-            required_cols = ['has_punctuation', 'has_capitalization']
-            if all(col in st.session_state.tokenizer.tokenized_df.columns for col in required_cols):
-                feature_data = pd.DataFrame({
-                    'Feature': ['With Punctuation', 'With Capitalization'],
-                    'Count': [
-                        st.session_state.tokenizer.tokenized_df['has_punctuation'].sum(),
-                        st.session_state.tokenizer.tokenized_df['has_capitalization'].sum()
-                    ]
-                })
-                st.bar_chart(feature_data.set_index('Feature'))
-        except Exception as e:
-            st.info("Content features chart not available")
+    # Show output format
+    st.subheader("📋 Output Format Preview")
+    if st.session_state.tokenizer.tokenized_df is not None:
+        st.dataframe(st.session_state.tokenizer.tokenized_df.head(), use_container_width=True)
+        st.info(f"Output contains exactly {len(st.session_state.tokenizer.tokenized_df.columns)} columns: {', '.join(st.session_state.tokenizer.tokenized_df.columns)}")
 
 def sample_sentences_page():
     st.markdown("<h2 class='section-header'>📝 Sample Sentences</h2>", unsafe_allow_html=True)
@@ -625,31 +608,19 @@ def sample_sentences_page():
 
     tokenized_df = st.session_state.tokenizer.tokenized_df
     
-    col1, col2 = st.columns(2)
+    if tokenized_df is None or tokenized_df.empty:
+        st.error("❌ No tokenized data available")
+        return
     
-    with col1:
-        # Shortest sentences
-        st.subheader("🔸 Shortest Sentences")
-        if 'sentence_length' in tokenized_df.columns:
-            shortest = tokenized_df.nsmallest(10, 'sentence_length')
-            for _, row in shortest.iterrows():
-                st.write(f"**{row['sentence_length']} chars:** {row['sentence_text']}")
-        
-        # Random samples
-        st.subheader("🔀 Random Samples")
-        random_samples = tokenized_df.sample(min(10, len(tokenized_df)))
-        for _, row in random_samples.iterrows():
-            preview = row['sentence_text'][:80] + "..." if len(row['sentence_text']) > 80 else row['sentence_text']
-            st.write(f"• {preview}")
+    # Show sample entries
+    st.subheader("🔀 Random Samples")
+    random_samples = tokenized_df.sample(min(10, len(tokenized_df)))
     
-    with col2:
-        # Longest sentences
-        st.subheader("🔹 Longest Sentences")
-        if 'sentence_length' in tokenized_df.columns:
-            longest = tokenized_df.nlargest(10, 'sentence_length')
-            for _, row in longest.iterrows():
-                preview = row['sentence_text'][:100] + "..." if len(row['sentence_text']) > 100 else row['sentence_text']
-                st.write(f"**{row['sentence_length']} chars:** {preview}")
+    for idx, (_, row) in enumerate(random_samples.iterrows(), 1):
+        with st.expander(f"Sample {idx}"):
+            for col in row.index:
+                if pd.notna(row[col]) and str(row[col]).strip():
+                    st.write(f"**{col}:** {row[col]}")
 
 def search_page():
     st.markdown("<h2 class='section-header'>🔍 Search Sentences</h2>", unsafe_allow_html=True)
@@ -675,20 +646,16 @@ def search_page():
             
             # Display results
             for idx, (_, row) in enumerate(matches.iterrows(), 1):
-                # Highlight the query in the sentence
-                highlighted = re.sub(f'({re.escape(query)})', r'**\1**', row['sentence_text'], flags=re.IGNORECASE)
-                
-                with st.expander(f"Result {idx} - Length: {row.get('sentence_length', 'N/A')} chars"):
-                    st.markdown(highlighted)
-                    
-                    # Additional info
-                    col1, col2, col3 = st.columns(3)
-                    with col1:
-                        st.metric("Length", row.get('sentence_length', 'N/A'))
-                    with col2:
-                        st.metric("Words", row.get('word_count', 'N/A'))
-                    with col3:
-                        st.metric("From Text", row.get('original_text_id', 'N/A'))
+                with st.expander(f"Result {idx}"):
+                    for col in row.index:
+                        if pd.notna(row[col]) and str(row[col]).strip():
+                            # Highlight the query if it's in this field
+                            text = str(row[col])
+                            if query.lower() in text.lower():
+                                highlighted = re.sub(f'({re.escape(query)})', r'**\1**', text, flags=re.IGNORECASE)
+                                st.markdown(f"**{col}:** {highlighted}")
+                            else:
+                                st.write(f"**{col}:** {text}")
         else:
             st.warning("❌ No sentences found containing the query")
 
@@ -701,11 +668,16 @@ def export_page():
 
     tokenized_df = st.session_state.tokenizer.tokenized_df
     
+    if tokenized_df is None or tokenized_df.empty:
+        st.error("❌ No tokenized data to export")
+        return
+    
     col1, col2 = st.columns(2)
     
     with col1:
         st.subheader("📊 Tokenized Sentences")
         st.success(f"✅ {len(tokenized_df)} sentences available")
+        st.info(f"Columns: {', '.join(tokenized_df.columns)}")
         
         # Convert DataFrame to CSV
         csv_data = tokenized_df.to_csv(index=False)
@@ -721,95 +693,34 @@ def export_page():
             st.dataframe(tokenized_df.head(10), use_container_width=True)
     
     with col2:
-        st.subheader("📋 Analysis Summary")
-        if st.session_state.tokenizer.sentence_stats:
-            stats = st.session_state.tokenizer.sentence_stats
-            
-            # Generate summary report
-            summary_lines = [
-                "SENTENCE TOKENIZATION STATISTICS",
-                "=" * 40,
-                f"Total sentences: {stats.get('total_sentences', 0):,}",
-                f"Original texts: {stats.get('unique_texts', 0):,}",
-                f"Avg sentences per text: {stats.get('avg_sentences_per_text', 0):.2f}",
-                "",
-                "Length Statistics:",
-            ]
-            
-            try:
-                if 'length_stats' in stats and stats['length_stats'] is not None:
-                    length_stats = stats['length_stats']
-                    if hasattr(length_stats, 'items'):
-                        for key, value in length_stats.items():
-                            summary_lines.append(f"  {key}: {value:.1f}")
-                    else:
-                        summary_lines.append("  Length statistics: Not available")
-                else:
-                    summary_lines.append("  Length statistics: Not available")
-            except:
-                summary_lines.append("  Length statistics: Not available")
-            
-            summary_lines.extend([
-                "",
-                "Word Count Statistics:",
-            ])
-            
-            try:
-                if 'word_count_stats' in stats and stats['word_count_stats'] is not None:
-                    word_count_stats = stats['word_count_stats']
-                    if hasattr(word_count_stats, 'items'):
-                        for key, value in word_count_stats.items():
-                            summary_lines.append(f"  {key}: {value:.1f}")
-                    else:
-                        summary_lines.append("  Word count statistics: Not available")
-                else:
-                    summary_lines.append("  Word count statistics: Not available")
-            except:
-                summary_lines.append("  Word count statistics: Not available")
-            
-            summary_lines.extend([
-                "",
-                f"Punctuation coverage: {stats.get('punctuation_pct', 0):.1f}%",
-                f"Capitalization coverage: {stats.get('capitalization_pct', 0):.1f}%"
-            ])
-            
-            summary_text = "\n".join(summary_lines)
-            
-            st.download_button(
-                label="📥 Download Analysis Summary (TXT)",
-                data=summary_text,
-                file_name="tokenization_statistics.txt",
-                mime="text/plain"
-            )
-            
-            # Preview
-            with st.expander("👀 Preview Summary"):
-                st.text(summary_text)
-    
-    # Sample sentences export
-    st.subheader("📝 Sample Sentences")
-    
-    if len(tokenized_df) > 0:
-        sample_size = st.slider("Sample size:", 10, min(500, len(tokenized_df)), 100)
-        sample_sentences = tokenized_df.sample(sample_size)
+        st.subheader("📋 Export Info")
+        st.write("**Output format confirmed:**")
+        st.write("✅ Contains only required columns")
+        st.write("✅ Ready for immediate use")
         
-        # Select available columns for sample export
-        sample_cols = ['sentence_id', 'sentence_text']
-        if 'sentence_length' in sample_sentences.columns:
-            sample_cols.append('sentence_length')
-        if 'word_count' in sample_sentences.columns:
-            sample_cols.append('word_count')
+        # Column verification
+        expected_columns = ['shortcode', 'turn', 'caption', 'transcript', 'post_url']
+        actual_columns = list(tokenized_df.columns)
         
-        sample_csv = sample_sentences[sample_cols].to_csv(index=False)
+        st.write("**Column verification:**")
+        for col in expected_columns:
+            if col in actual_columns:
+                st.write(f"✅ {col}")
+            else:
+                st.write(f"❌ {col} (missing)")
+        
+        # Sample export
+        st.subheader("📝 Sample Export")
+        sample_size = st.slider("Sample size:", 10, min(100, len(tokenized_df)), 20)
+        sample_df = tokenized_df.head(sample_size)
+        
+        sample_csv = sample_df.to_csv(index=False)
         st.download_button(
-            label="📥 Download Sample Sentences (CSV)",
+            label="📥 Download Sample (CSV)",
             data=sample_csv,
-            file_name=f"sample_sentences_{sample_size}.csv",
+            file_name=f"sample_tokenized_{sample_size}.csv",
             mime="text/csv"
         )
-        
-        with st.expander("👀 Preview Sample"):
-            st.dataframe(sample_sentences[sample_cols].head(10), use_container_width=True)
 
 def show_progress():
     """Show progress in sidebar"""
@@ -838,14 +749,11 @@ def show_data_stats():
         
         if st.session_state.tokenization_done and tokenizer.tokenized_df is not None:
             st.sidebar.metric("Total Sentences", len(tokenizer.tokenized_df))
-            
-            if tokenizer.sentence_stats:
-                avg_length = tokenizer.sentence_stats.get('length_stats', {}).get('mean', 0)
-                st.sidebar.metric("Avg Length", f"{avg_length:.0f} chars")
+            st.sidebar.metric("Output Columns", len(tokenizer.tokenized_df.columns))
 
 def main():
     st.markdown("<h1 class='main-header'>📝 Text Sentence Tokenizer</h1>", unsafe_allow_html=True)
-    st.markdown("### Transform your text data into sentence-level format for analysis")
+    st.markdown("### Transform your text data into sentence-level format with specific columns")
 
     # Sidebar navigation
     st.sidebar.title("🔧 Navigation")
@@ -861,6 +769,11 @@ def main():
         ["📁 Data Upload", "🔧 Tokenization", "📊 Analysis", "📝 Sample Sentences", "🔍 Search", "💾 Export"]
     )
 
+    # Add important note about output format
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📋 Output Format")
+    st.sidebar.info("CSV will contain ONLY these columns:\n• shortcode\n• turn\n• caption\n• transcript\n• post_url")
+    
     # Add help section in sidebar
     st.sidebar.markdown("---")
     st.sidebar.markdown("### ❓ Help")
@@ -899,11 +812,11 @@ def main():
     
     with st.sidebar.expander("💡 Tips"):
         st.markdown("""
-        - Start with **Basic** tokenization
-        - Use **Advanced** for formal text
-        - Set appropriate length filters
-        - Check sample results before export
-        - Search functionality helps validate results
+        - Upload data with required columns if available
+        - Select the text column to tokenize
+        - Output will only contain the 5 specified columns
+        - Missing columns will be handled automatically
+        - Check sample results before full export
         """)
 
     # Main page routing
