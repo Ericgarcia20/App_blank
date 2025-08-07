@@ -44,6 +44,7 @@ class RollingContextProcessor:
         self.message_col = None
         self.timestamp_col = None
         self.speaker_col = None
+        self.id_col = None  # Added for ID column
         self.window_size = 5
         self.overlap = 1
         self.include_system_msgs = True
@@ -99,12 +100,13 @@ class RollingContextProcessor:
             st.error(f"❌ Error loading file: {str(e)}")
             return False
 
-    def configure_columns(self, message_col, conversation_id_col=None, speaker_col=None, timestamp_col=None):
+    def configure_columns(self, message_col, conversation_id_col=None, speaker_col=None, timestamp_col=None, id_col=None):
         """Configure which columns contain conversation data"""
         self.message_col = message_col
         self.conversation_id_col = conversation_id_col if conversation_id_col != "None" else None
         self.speaker_col = speaker_col if speaker_col != "None" else None
         self.timestamp_col = timestamp_col if timestamp_col != "None" else None
+        self.id_col = id_col if id_col != "None" else None
         
         # Auto-generate conversation IDs if not provided
         if self.conversation_id_col is None:
@@ -122,12 +124,12 @@ class RollingContextProcessor:
         return True
 
     def process_rolling_windows(self):
-        """Process conversations into rolling context windows"""
+        """Process conversations into rolling context windows - FIXED to output specific columns only"""
         if self.raw_df is None:
             return False
         
         self.context_windows = []
-        window_id = 0
+        window_count = 0
         
         # Group by conversation
         conversations = self.raw_df.groupby(self.conversation_id_col)
@@ -158,22 +160,22 @@ class RollingContextProcessor:
             # Create rolling windows for this conversation
             num_messages = len(messages)
             if num_messages < self.window_size:
-                window = self.create_context_window(messages, conv_id, window_id, 0)
+                window = self.create_context_window(messages, conv_id, window_count)
                 if window:
                     self.context_windows.append(window)
-                    window_id += 1
+                    window_count += 1
             else:
                 stride = self.window_size - self.overlap
                 for start_idx in range(0, num_messages - self.window_size + 1, stride):
                     end_idx = start_idx + self.window_size
                     window_messages = messages.iloc[start_idx:end_idx]
                     
-                    window = self.create_context_window(window_messages, conv_id, window_id, start_idx)
+                    window = self.create_context_window(window_messages, conv_id, window_count)
                     if window:
                         self.context_windows.append(window)
-                        window_id += 1
+                        window_count += 1
         
-        # Create processed DataFrame
+        # Create processed DataFrame with ONLY the required columns
         if self.context_windows:
             self.processed_df = pd.DataFrame(self.context_windows)
             progress_bar.progress(1.0)
@@ -183,9 +185,10 @@ class RollingContextProcessor:
             status_text.text("❌ No context windows were created")
             return False
 
-    def create_context_window(self, messages, conv_id, window_id, start_idx):
-        """Create a single context window from messages"""
+    def create_context_window(self, messages, conv_id, window_count):
+        """Create a single context window with only the required columns"""
         try:
+            # Format the context based on format type
             if self.format_type == 'simple':
                 context = ' '.join(messages[self.message_col].astype(str).tolist())
                 
@@ -193,15 +196,15 @@ class RollingContextProcessor:
                 context_parts = []
                 for _, msg in messages.iterrows():
                     if self.speaker_col and pd.notna(msg[self.speaker_col]):
-                        context_parts.append(f"{msg[self.speaker_col]}: {msg[self.message_col]}")
+                        context_parts.append(f"Turn {len(context_parts)+1} ({msg[self.speaker_col]}): {msg[self.message_col]}")
                     else:
-                        context_parts.append(str(msg[self.message_col]))
+                        context_parts.append(f"Turn {len(context_parts)+1}: {msg[self.message_col]}")
                 context = '\n'.join(context_parts)
                 
             elif self.format_type == 'json':
                 json_messages = []
-                for _, msg in messages.iterrows():
-                    msg_obj = {'message': str(msg[self.message_col])}
+                for i, (_, msg) in enumerate(messages.iterrows()):
+                    msg_obj = {'turn': i+1, 'message': str(msg[self.message_col])}
                     if self.speaker_col and pd.notna(msg[self.speaker_col]):
                         msg_obj['speaker'] = str(msg[self.speaker_col])
                     if self.timestamp_col and pd.notna(msg[self.timestamp_col]):
@@ -213,35 +216,26 @@ class RollingContextProcessor:
                 context_parts = []
                 for i, (_, msg) in enumerate(messages.iterrows()):
                     speaker = msg[self.speaker_col] if self.speaker_col and pd.notna(msg[self.speaker_col]) else f"Speaker{i%2+1}"
-                    context_parts.append(f"{speaker}: {msg[self.message_col]}")
+                    context_parts.append(f"Turn {i+1} ({speaker}): {msg[self.message_col]}")
                 context = '\n'.join(context_parts)
             
+            # Get the first message for Statement column and other required fields
+            first_message = messages.iloc[0]
+            last_message = messages.iloc[-1]
+            
+            # Create window with ONLY the 5 required columns
             window = {
-                'window_id': window_id,
-                'conversation_id': conv_id,
-                'start_message_idx': start_idx,
-                'end_message_idx': start_idx + len(messages) - 1,
-                'num_messages': len(messages),
-                'context': context,
-                'context_length': len(context),
-                'word_count': len(context.split()),
-                'unique_speakers': len(messages[self.speaker_col].unique()) if self.speaker_col else 1,
-                'has_timestamps': bool(self.timestamp_col and messages[self.timestamp_col].notna().any()),
-                'format_type': self.format_type
+                'ID': first_message[self.id_col] if self.id_col and self.id_col in first_message.index else f"WIN_{window_count:06d}",
+                'Turn': len(messages),  # Number of turns/messages in this window
+                'Speaker': first_message[self.speaker_col] if self.speaker_col and pd.notna(first_message[self.speaker_col]) else 'unknown',
+                'Context': context,
+                'Statement': str(last_message[self.message_col])  # The last message as the statement
             }
-            
-            window['first_message'] = str(messages.iloc[0][self.message_col])[:100]
-            window['last_message'] = str(messages.iloc[-1][self.message_col])[:100]
-            
-            if self.timestamp_col and self.timestamp_col in messages.columns:
-                timestamps = messages[self.timestamp_col].dropna()
-                if not timestamps.empty:
-                    window['start_timestamp'] = timestamps.iloc[0]
-                    window['end_timestamp'] = timestamps.iloc[-1]
             
             return window
             
         except Exception as e:
+            st.error(f"Error creating window: {e}")
             return None
 
     def analyze_window_statistics(self):
@@ -250,20 +244,19 @@ class RollingContextProcessor:
             return
 
         total_windows = len(self.processed_df)
-        unique_conversations = self.processed_df['conversation_id'].nunique()
         
-        context_lengths = self.processed_df['context_length']
-        word_counts = self.processed_df['word_count']
-        message_counts = self.processed_df['num_messages']
+        # Calculate statistics based on available columns
+        context_lengths = self.processed_df['Context'].str.len()
+        word_counts = self.processed_df['Context'].str.split().str.len()
+        turn_counts = self.processed_df['Turn']
 
         self.window_stats = {
             'total_windows': total_windows,
-            'unique_conversations': unique_conversations,
-            'avg_windows_per_conv': total_windows/unique_conversations,
             'context_length_stats': context_lengths.describe(),
             'word_count_stats': word_counts.describe(),
-            'message_count_stats': message_counts.describe(),
-            'format_distribution': self.processed_df['format_type'].value_counts().to_dict() if 'format_type' in self.processed_df.columns else {}
+            'turn_count_stats': turn_counts.describe(),
+            'unique_speakers': self.processed_df['Speaker'].nunique() if 'Speaker' in self.processed_df.columns else 0,
+            'format_type': self.format_type
         }
 
     def search_windows(self, query, max_results=20):
@@ -271,10 +264,17 @@ class RollingContextProcessor:
         if self.processed_df is None or self.processed_df.empty:
             return pd.DataFrame()
 
-        matches = self.processed_df[
-            self.processed_df['context'].str.contains(query, case=False, na=False)
+        # Search in Context and Statement columns
+        context_matches = self.processed_df[
+            self.processed_df['Context'].str.contains(query, case=False, na=False)
         ]
-
+        
+        statement_matches = self.processed_df[
+            self.processed_df['Statement'].str.contains(query, case=False, na=False)
+        ]
+        
+        # Combine and remove duplicates
+        matches = pd.concat([context_matches, statement_matches]).drop_duplicates()
         return matches.head(max_results)
 
 # Initialize session state
@@ -346,8 +346,14 @@ def column_configuration_page():
             help="Column containing the actual message text"
         )
         
+        # Optional: ID column for the output ID field
+        id_col = st.selectbox(
+            "ID Column",
+            column_options,
+            help="Column to use for the output ID field (will auto-generate if None)"
+        )
+        
         # Optional: Conversation ID
-        st.subheader("🔗 Optional Fields")
         conversation_id_col = st.selectbox(
             "Conversation ID Column",
             column_options,
@@ -356,6 +362,7 @@ def column_configuration_page():
     
     with col2:
         # Optional: Speaker column
+        st.subheader("🔗 Optional Fields")
         speaker_col = st.selectbox(
             "Speaker/Role Column",
             column_options,
@@ -369,6 +376,17 @@ def column_configuration_page():
             help="Column with message timestamps for chronological ordering"
         )
     
+    # Expected output format info
+    st.subheader("📋 Output Format")
+    st.info("""
+    The output will contain exactly these 5 columns:
+    • **ID** - Unique identifier for each window
+    • **Turn** - Number of turns/messages in the window
+    • **Speaker** - Speaker from the first message in window
+    • **Context** - Formatted conversation context
+    • **Statement** - The last message in the window
+    """)
+    
     # Configuration preview
     st.subheader("🔍 Configuration Preview")
     
@@ -376,6 +394,9 @@ def column_configuration_page():
         preview_data = {
             'Message': st.session_state.processor.raw_df[message_col].head(3).tolist(),
         }
+        
+        if id_col != "None":
+            preview_data['ID'] = st.session_state.processor.raw_df[id_col].head(3).tolist()
         
         if conversation_id_col != "None":
             preview_data['Conversation ID'] = st.session_state.processor.raw_df[conversation_id_col].head(3).tolist()
@@ -392,7 +413,7 @@ def column_configuration_page():
     # Confirm configuration
     if st.button("✅ Confirm Configuration", type="primary"):
         if st.session_state.processor.configure_columns(
-            message_col, conversation_id_col, speaker_col, timestamp_col
+            message_col, conversation_id_col, speaker_col, timestamp_col, id_col
         ):
             st.session_state.columns_configured = True
             st.success("🎉 Configuration saved successfully!")
@@ -401,6 +422,7 @@ def column_configuration_page():
             st.info(f"""
             **Configuration Summary:**
             - Message column: {message_col}
+            - ID column: {id_col if id_col != 'None' else 'Auto-generated'}
             - Conversation ID: {conversation_id_col if conversation_id_col != 'None' else 'Auto-generated'}
             - Speaker column: {speaker_col if speaker_col != 'None' else 'Not specified'}
             - Timestamp column: {timestamp_col if timestamp_col != 'None' else 'Not specified'}
@@ -456,24 +478,24 @@ def window_configuration_page():
             help="How to format the context window output"
         )
         
+        # Expected output preview
+        st.subheader("📋 Expected Output Columns")
+        expected_columns = ["ID", "Turn", "Speaker", "Context", "Statement"]
+        for i, col in enumerate(expected_columns, 1):
+            st.write(f"{i}. **{col}**")
+        
         # Format examples
         st.subheader("💡 Format Examples")
         
-        example_messages = [
-            ("User", "Hello, I need help"),
-            ("Assistant", "How can I help you?"),
-            ("User", "I have a question")
-        ]
-        
         with st.expander("See format examples"):
             if format_type == "structured":
-                st.code("User: Hello, I need help\nAssistant: How can I help you?\nUser: I have a question")
+                st.code("Turn 1 (User): Hello, I need help\nTurn 2 (Assistant): How can I help you?\nTurn 3 (User): I have a question")
             elif format_type == "simple":
                 st.code("Hello, I need help How can I help you? I have a question")
             elif format_type == "json":
-                st.code('[{"speaker": "User", "message": "Hello, I need help"}, {"speaker": "Assistant", "message": "How can I help you?"}]')
+                st.code('[{"turn": 1, "speaker": "User", "message": "Hello, I need help"}, {"turn": 2, "speaker": "Assistant", "message": "How can I help you?"}]')
             elif format_type == "conversation":
-                st.code("User: Hello, I need help\nAssistant: How can I help you?\nUser: I have a question")
+                st.code("Turn 1 (User): Hello, I need help\nTurn 2 (Assistant): How can I help you?\nTurn 3 (User): I have a question")
     
     # Current data stats
     st.subheader("📊 Dataset Statistics")
@@ -507,9 +529,15 @@ def window_configuration_page():
                     st.session_state.processing_done = True
                     st.success("🎉 Processing completed!")
                     
-                    # Show quick stats
-                    total_windows = len(st.session_state.processor.processed_df)
+                    # Show quick stats and preview
+                    processed_df = st.session_state.processor.processed_df
+                    total_windows = len(processed_df)
                     st.metric("Windows Created", f"{total_windows:,}")
+                    
+                    # Show output preview with correct columns
+                    st.subheader("📋 Output Preview")
+                    st.dataframe(processed_df.head(), use_container_width=True)
+                    st.success(f"✅ Output contains exactly {len(processed_df.columns)} columns: {', '.join(processed_df.columns)}")
 
 def analysis_page():
     st.markdown("<h2 class='section-header'>📊 Analysis & Results</h2>", unsafe_allow_html=True)
@@ -529,12 +557,12 @@ def analysis_page():
     with col1:
         st.metric("Total Windows", f"{stats['total_windows']:,}")
     with col2:
-        st.metric("Conversations", f"{stats['unique_conversations']:,}")
+        st.metric("Unique Speakers", f"{stats['unique_speakers']:,}")
     with col3:
-        st.metric("Avg Windows/Conv", f"{stats['avg_windows_per_conv']:.1f}")
-    with col4:
         avg_length = stats['context_length_stats']['mean']
         st.metric("Avg Context Length", f"{avg_length:.0f} chars")
+    with col4:
+        st.metric("Output Columns", "5")
 
     # Detailed statistics
     col1, col2, col3 = st.columns(3)
@@ -558,40 +586,19 @@ def analysis_page():
             st.dataframe(word_df, use_container_width=True)
     
     with col3:
-        st.subheader("💬 Message Count Stats")
-        if not stats['message_count_stats'].empty:
-            msg_df = pd.DataFrame({
-                'Statistic': stats['message_count_stats'].index,
-                'Value': stats['message_count_stats'].values
+        st.subheader("🔄 Turn Count Stats")
+        if not stats['turn_count_stats'].empty:
+            turn_df = pd.DataFrame({
+                'Statistic': stats['turn_count_stats'].index,
+                'Value': stats['turn_count_stats'].values
             })
-            st.dataframe(msg_df, use_container_width=True)
+            st.dataframe(turn_df, use_container_width=True)
 
-    # Visualizations using Streamlit charts
-    st.subheader("📊 Data Visualizations")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        # Context length distribution
-        st.subheader("Context Length Distribution")
-        length_counts = st.session_state.processor.processed_df['context_length'].value_counts().sort_index()
-        st.bar_chart(length_counts)
-        
-        # Word count distribution
-        st.subheader("Word Count Distribution")
-        word_counts = st.session_state.processor.processed_df['word_count'].value_counts().sort_index()
-        st.bar_chart(word_counts)
-    
-    with col2:
-        # Windows per conversation
-        st.subheader("Windows per Conversation")
-        windows_per_conv = st.session_state.processor.processed_df.groupby('conversation_id').size()
-        st.bar_chart(windows_per_conv.value_counts().sort_index())
-        
-        # Message count distribution
-        st.subheader("Messages per Window")
-        msg_counts = st.session_state.processor.processed_df['num_messages'].value_counts().sort_index()
-        st.bar_chart(msg_counts)
+    # Show output format
+    st.subheader("📋 Output Format Preview")
+    processed_df = st.session_state.processor.processed_df
+    st.dataframe(processed_df.head(), use_container_width=True)
+    st.info(f"✅ Output contains exactly {len(processed_df.columns)} columns: {', '.join(processed_df.columns)}")
 
 def sample_windows_page():
     st.markdown("<h2 class='section-header'>📝 Sample Context Windows</h2>", unsafe_allow_html=True)
@@ -602,31 +609,26 @@ def sample_windows_page():
 
     processed_df = st.session_state.processor.processed_df
     
-    col1, col2 = st.columns(2)
+    if processed_df is None or processed_df.empty:
+        st.error("❌ No processed data available")
+        return
     
-    with col1:
-        # Shortest windows
-        st.subheader("🔸 Shortest Context Windows")
-        shortest = processed_df.nsmallest(5, 'context_length')
-        for _, row in shortest.iterrows():
-            with st.expander(f"Window {row['window_id']} - {row['context_length']} chars"):
-                st.text(row['context'][:300] + "..." if len(row['context']) > 300 else row['context'])
-        
-        # Random samples
-        st.subheader("🔀 Random Samples")
-        random_samples = processed_df.sample(min(5, len(processed_df)))
-        for _, row in random_samples.iterrows():
-            with st.expander(f"Window {row['window_id']} - Conv {row['conversation_id']}"):
-                preview = row['context'][:200] + "..." if len(row['context']) > 200 else row['context']
-                st.text(preview)
+    # Show sample entries
+    st.subheader("🔀 Random Samples")
+    random_samples = processed_df.sample(min(10, len(processed_df)))
     
-    with col2:
-        # Longest windows
-        st.subheader("🔹 Longest Context Windows")
-        longest = processed_df.nlargest(5, 'context_length')
-        for _, row in longest.iterrows():
-            with st.expander(f"Window {row['window_id']} - {row['context_length']} chars"):
-                st.text(row['context'][:300] + "..." if len(row['context']) > 300 else row['context'])
+    for idx, (_, row) in enumerate(random_samples.iterrows(), 1):
+        with st.expander(f"Sample {idx} - ID: {row['ID']}"):
+            col1, col2 = st.columns(2)
+            with col1:
+                st.write(f"**ID:** {row['ID']}")
+                st.write(f"**Turn:** {row['Turn']}")
+                st.write(f"**Speaker:** {row['Speaker']}")
+            with col2:
+                st.write(f"**Statement:** {row['Statement'][:100]}...")
+            
+            st.write(f"**Context:**")
+            st.text(row['Context'][:300] + "..." if len(str(row['Context'])) > 300 else str(row['Context']))
 
 def search_page():
     st.markdown("<h2 class='section-header'>🔍 Search Context Windows</h2>", unsafe_allow_html=True)
@@ -652,22 +654,22 @@ def search_page():
             
             # Display results
             for idx, (_, row) in enumerate(matches.iterrows(), 1):
-                # Highlight the query in the context
-                highlighted = re.sub(f'({re.escape(query)})', r'**\1**', row['context'], flags=re.IGNORECASE)
-                
-                with st.expander(f"Result {idx} - Window {row['window_id']} (Conv: {row['conversation_id']})"):
-                    st.markdown(highlighted[:500] + "..." if len(highlighted) > 500 else highlighted)
-                    
-                    # Additional info
-                    col1, col2, col3, col4 = st.columns(4)
+                with st.expander(f"Result {idx} - ID: {row['ID']}"):
+                    # Show all 5 columns
+                    col1, col2, col3 = st.columns(3)
                     with col1:
-                        st.metric("Length", f"{row['context_length']:,}")
+                        st.metric("ID", row['ID'])
+                        st.metric("Turn", row['Turn'])
                     with col2:
-                        st.metric("Words", f"{row['word_count']:,}")
+                        st.metric("Speaker", row['Speaker'])
                     with col3:
-                        st.metric("Messages", row['num_messages'])
-                    with col4:
-                        st.metric("Speakers", row.get('unique_speakers', 'N/A'))
+                        st.write("**Statement:**")
+                        st.write(row['Statement'][:100] + "..." if len(row['Statement']) > 100 else row['Statement'])
+                    
+                    st.write("**Context:**")
+                    # Highlight the query in the context
+                    highlighted = re.sub(f'({re.escape(query)})', r'**\1**', str(row['Context']), flags=re.IGNORECASE)
+                    st.markdown(highlighted[:500] + "..." if len(highlighted) > 500 else highlighted)
         else:
             st.warning("❌ No context windows found containing the query")
 
@@ -680,28 +682,23 @@ def export_page():
 
     processed_df = st.session_state.processor.processed_df
     
+    if processed_df is None or processed_df.empty:
+        st.error("❌ No processed data to export")
+        return
+    
     col1, col2 = st.columns(2)
     
     with col1:
         st.subheader("📊 Complete Dataset")
         st.success(f"✅ {len(processed_df)} context windows available")
+        st.info(f"Columns: {', '.join(processed_df.columns)}")
         
         # Complete dataset export
         csv_data = processed_df.to_csv(index=False)
         st.download_button(
             label="📥 Download Complete Dataset (CSV)",
             data=csv_data,
-            file_name="context_windows.csv",
-            mime="text/csv"
-        )
-        
-        # Context-only export
-        contexts_only = processed_df[['window_id', 'conversation_id', 'context']].copy()
-        contexts_csv = contexts_only.to_csv(index=False)
-        st.download_button(
-            label="📥 Download Contexts Only (CSV)",
-            data=contexts_csv,
-            file_name="contexts_only.csv",
+            file_name="rolling_context_windows.csv",
             mime="text/csv"
         )
         
@@ -710,21 +707,40 @@ def export_page():
             st.dataframe(processed_df.head(10), use_container_width=True)
     
     with col2:
-        st.subheader("🎯 ML Training Formats")
+        st.subheader("📋 Export Verification")
+        st.write("**Column verification:**")
+        expected_columns = ['ID', 'Turn', 'Speaker', 'Context', 'Statement']
+        actual_columns = list(processed_df.columns)
+        
+        for col in expected_columns:
+            if col in actual_columns:
+                st.write(f"✅ {col}")
+            else:
+                st.write(f"❌ {col} (missing)")
+        
+        # Sample export
+        st.subheader("📝 Sample Export")
+        sample_size = st.slider("Sample size:", 10, min(100, len(processed_df)), 20)
+        sample_df = processed_df.head(sample_size)
+        
+        sample_csv = sample_df.to_csv(index=False)
+        st.download_button(
+            label="📥 Download Sample (CSV)",
+            data=sample_csv,
+            file_name=f"sample_context_windows_{sample_size}.csv",
+            mime="text/csv"
+        )
         
         # JSONL format for ML training
+        st.subheader("🎯 ML Training Format")
         jsonl_data = []
         for _, row in processed_df.iterrows():
             jsonl_entry = {
-                'id': row['window_id'],
-                'conversation_id': row['conversation_id'],
-                'context': row['context'],
-                'metadata': {
-                    'num_messages': row['num_messages'],
-                    'context_length': row['context_length'],
-                    'word_count': row['word_count'],
-                    'format_type': row['format_type']
-                }
+                'id': row['ID'],
+                'turn': row['Turn'],
+                'speaker': row['Speaker'],
+                'context': row['Context'],
+                'statement': row['Statement']
             }
             jsonl_data.append(json.dumps(jsonl_entry, ensure_ascii=False))
         
@@ -735,112 +751,6 @@ def export_page():
             file_name="context_windows.jsonl",
             mime="application/json"
         )
-        
-        # Training splits
-        st.subheader("🔀 Training Splits")
-        
-        col_a, col_b, col_c = st.columns(3)
-        with col_a:
-            train_ratio = st.slider("Train %", 0.1, 0.9, 0.8, 0.1)
-        with col_b:
-            val_ratio = st.slider("Validation %", 0.05, 0.5, 0.1, 0.05)
-        with col_c:
-            test_ratio = 1.0 - train_ratio - val_ratio
-            st.metric("Test %", f"{test_ratio:.2f}")
-        
-        if st.button("📂 Create Training Splits"):
-            if abs(train_ratio + val_ratio + test_ratio - 1.0) < 0.001:
-                # Create splits
-                shuffled_df = processed_df.sample(frac=1, random_state=42).reset_index(drop=True)
-                total_windows = len(shuffled_df)
-                
-                train_size = int(total_windows * train_ratio)
-                val_size = int(total_windows * val_ratio)
-                
-                train_df = shuffled_df[:train_size]
-                val_df = shuffled_df[train_size:train_size + val_size]
-                test_df = shuffled_df[train_size + val_size:]
-                
-                # Export splits
-                train_csv = train_df.to_csv(index=False)
-                val_csv = val_df.to_csv(index=False)
-                test_csv = test_df.to_csv(index=False)
-                
-                st.success(f"✅ Splits created: Train({len(train_df)}), Val({len(val_df)}), Test({len(test_df)})")
-                
-                col_d, col_e, col_f = st.columns(3)
-                with col_d:
-                    st.download_button("📥 Train Set", train_csv, "train_context_windows.csv", "text/csv")
-                with col_e:
-                    st.download_button("📥 Val Set", val_csv, "val_context_windows.csv", "text/csv")
-                with col_f:
-                    st.download_button("📥 Test Set", test_csv, "test_context_windows.csv", "text/csv")
-            else:
-                st.error("❌ Ratios must sum to 1.0")
-    
-    # Analysis summary export
-    st.subheader("📋 Analysis Summary")
-    
-    if st.session_state.processor.window_stats:
-        stats = st.session_state.processor.window_stats
-        
-        summary_lines = [
-            "ROLLING CONTEXT WINDOW STATISTICS",
-            "=" * 40,
-            f"Total windows: {stats['total_windows']:,}",
-            f"Unique conversations: {stats['unique_conversations']:,}",
-            f"Avg windows per conversation: {stats['avg_windows_per_conv']:.2f}",
-            f"Window size: {st.session_state.processor.window_size}",
-            f"Overlap: {st.session_state.processor.overlap}",
-            f"Format type: {st.session_state.processor.format_type}",
-            "",
-            "Context Length Statistics:",
-        ]
-        
-        for key, value in stats['context_length_stats'].items():
-            summary_lines.append(f"  {key}: {value:.1f}")
-        
-        summary_lines.extend([
-            "",
-            "Word Count Statistics:",
-        ])
-        
-        for key, value in stats['word_count_stats'].items():
-            summary_lines.append(f"  {key}: {value:.1f}")
-        
-        if stats['format_distribution']:
-            summary_lines.extend([
-                "",
-                "Format Distribution:",
-            ])
-            for fmt, count in stats['format_distribution'].items():
-                summary_lines.append(f"  {fmt}: {count:,}")
-        
-        summary_text = "\n".join(summary_lines)
-        
-        st.download_button(
-            label="📥 Download Analysis Summary (TXT)",
-            data=summary_text,
-            file_name="window_processing_statistics.txt",
-            mime="text/plain"
-        )
-        
-        with st.expander("👀 Preview Summary"):
-            st.text(summary_text)
-    
-    # Sample export
-    st.subheader("📝 Sample Export")
-    
-    sample_size = st.slider("Sample size:", 10, min(500, len(processed_df)), 50)
-    sample_df = processed_df.sample(sample_size)
-    
-    sample_csv = sample_df[['window_id', 'conversation_id', 'context', 'context_length', 'word_count']].to_csv(index=False)
-    st.download_button(
-        label="📥 Download Sample Windows (CSV)",
-        data=sample_csv,
-        file_name=f"sample_context_windows_{sample_size}.csv",
-        mime="text/csv"
-    )
 
 def show_progress():
     """Show progress in sidebar"""
@@ -874,14 +784,11 @@ def show_data_stats():
         
         if st.session_state.processing_done and processor.processed_df is not None:
             st.sidebar.metric("Context Windows", len(processor.processed_df))
-            
-            if processor.window_stats:
-                avg_length = processor.window_stats.get('context_length_stats', {}).get('mean', 0)
-                st.sidebar.metric("Avg Context Length", f"{avg_length:.0f}")
+            st.sidebar.metric("Output Columns", len(processor.processed_df.columns))
 
 def main():
     st.markdown("<h1 class='main-header'>🔄 Rolling Context Window Processor</h1>", unsafe_allow_html=True)
-    st.markdown("### Upload your conversation dataset and process it with rolling context windows")
+    st.markdown("### Process conversation data into rolling context windows with specific output format")
 
     # Sidebar navigation
     st.sidebar.title("🔧 Navigation")
@@ -896,6 +803,11 @@ def main():
         "Choose a section:",
         ["📁 Data Upload", "📋 Column Config", "🔧 Window Config", "📊 Analysis", "📝 Sample Windows", "🔍 Search", "💾 Export"]
     )
+
+    # Add important note about output format
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("### 📋 Output Format")
+    st.sidebar.info("CSV will contain ONLY these columns:\n• ID\n• Turn\n• Speaker\n• Context\n• Statement")
 
     # Add help section in sidebar
     st.sidebar.markdown("---")
@@ -931,12 +843,13 @@ def main():
         - Determines how much windows advance
         """)
     
-    with st.sidebar.expander("📄 Output Formats"):
+    with st.sidebar.expander("📄 Output Columns"):
         st.markdown("""
-        **Structured:** Speaker: Message format
-        **Simple:** Plain text concatenation
-        **JSON:** Structured message objects
-        **Conversation:** Turn-based dialogue
+        **ID:** Unique identifier for each window
+        **Turn:** Number of turns/messages in window
+        **Speaker:** Speaker from first message
+        **Context:** Formatted conversation context
+        **Statement:** Last message in the window
         """)
     
     with st.sidebar.expander("💡 Use Cases"):
